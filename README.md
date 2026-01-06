@@ -1,3 +1,4 @@
-## Welcome to Git!
+## Howdy boys and Wlcome to Git!
 
-- I'm adding this from `dev-adam`
+- Hello, This is `Dean`
+- I'm adding this from `dev-dean`
