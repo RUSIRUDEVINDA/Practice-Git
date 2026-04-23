@@ -1,0 +1,1046 @@
+# Healthcare Platform Backend — Full Architecture & Integration Reference
+
+> **Last updated:** 2026-04-23  
+> **Stack:** Go (Gin) · PostgreSQL · RabbitMQ · Cloudinary · Cloudflare R2 · Jitsi Meet · PayHere · JWT
+
+---
+
+## Table of Contents
+
+1. [High-Level Architecture Overview](#1-high-level-architecture-overview)
+2. [Infrastructure & Shared Components](#2-infrastructure--shared-components)
+3. [Auth Service](#3-auth-service)
+4. [Patient Service](#4-patient-service)
+5. [Appointment Service](#5-appointment-service)
+6. [Payment Service](#6-payment-service)
+7. [Telemedicine Service](#7-telemedicine-service)
+8. [File Storage Service](#8-file-storage-service)
+9. [RabbitMQ — Full Event Map](#9-rabbitmq--full-event-map)
+10. [Inter-Service HTTP Calls](#10-inter-service-http-calls)
+11. [Database Summary](#11-database-summary)
+12. [Security & Auth Mechanisms](#12-security--auth-mechanisms)
+13. [Third-Party API Integrations](#13-third-party-api-integrations)
+
+---
+
+## 1. High-Level Architecture Overview
+
+```
+                          ┌─────────────────────────────────────────────────────┐
+                          │  Client (Web / Mobile)                              │
+                          └────────────────────────┬────────────────────────────┘
+                                                   │ HTTP / HTTPS  (port 80)
+                          ┌────────────────────────▼────────────────────────────┐
+                          │  Nginx Reverse Proxy (entry point for all traffic)  │
+                          └──┬──────┬──────┬──────┬──────┬─────────────────────┘
+                             │      │      │      │      │
+                    ┌────────▼──┐   │   ┌──▼───┐  │   ┌──▼──────────────────────┐
+                    │API Gateway│   │   │Auth  │  │   │  All Other Services      │
+                    │(JWT verify│   │   │Service│  │   │  (patient, appt, pay,   │
+                    │ + routing)│   │   │:8001  │  │   │   telemedicine, files…) │
+                    └─────┬─────┘   │   └──┬───┘  │   └──────────────────────── ┘
+                          │         │      │       │
+                          │         │      ▼       │
+                          │         │  PostgreSQL   │
+                          │         │  (auth_db)    │
+                          │         │               │
+                          │         ▼               ▼
+                          │       RabbitMQ (amqp://rabbitmq:5672)
+                          │       ┌─────────────────────────────┐
+                          │       │  Exchanges (topic):          │
+                          │       │  • user_events               │
+                          │       │  • appointment_events        │
+                          │       │  • payment_events            │
+                          │       │  • doctor_events             │
+                          │       │  • file_events               │
+                          │       └─────────────────────────────┘
+                          │
+        ┌─────────────────┼──────────────────────────────────────────────────┐
+        │                 │                                                   │
+   ┌────▼───┐   ┌─────────▼──┐   ┌──────────┐   ┌───────────┐   ┌──────────┐
+   │patient │   │appointment │   │ payment  │   │telemedicine│   │  file    │
+   │service │   │ service    │   │ service  │   │ service    │   │ storage  │
+   │:8002   │   │ :8004      │   │ :8005    │   │ :8009      │   │ :8010    │
+   └────┬───┘   └─────┬──────┘   └────┬─────┘   └─────┬──────┘   └────┬─────┘
+        │              │               │                │               │
+   patient_db    appointment_db   payment_db   telemedicine_db   file_storage_db
+   (5434)        (5435)           (5437)       (5438)            (5436)
+```
+
+**Pattern:** Every microservice owns its own **dedicated PostgreSQL database**. Services **never share** a database — cross-service data is fetched either via async events (RabbitMQ) or synchronous internal HTTP calls.
+
+---
+
+## 2. Infrastructure & Shared Components
+
+### 2.1 PostgreSQL Databases
+
+Each service has a dedicated PostgreSQL 17 instance:
+
+| Service | Database | Local Port |
+|---|---|---|
+| auth-service | `auth_db` | 5433 |
+| patient-service | `patient_db` | 5434 |
+| appointment-service | `appointment_db` | 5435 |
+| file-storage-service | `file_storage_db` | 5436 |
+| payment-service | `payment_db` | 5437 |
+| telemedicine-service | `telemedicine_db` | 5438 |
+| doctor-service | `doctor_db` | 5439 |
+| admin-service | `admin_db` | 5440 |
+| ai-symptom-service | `symptom_db` | — |
+| support-service | `support_db` | 5443 |
+
+Databases use **Docker named volumes** for persistence across restarts.  
+**Migrations** are run at service startup using the `migrate` library, scanning the `migrations/` directory inside each service.
+
+### 2.2 RabbitMQ
+
+- **Image:** `rabbitmq:3.12-management-alpine`
+- **AMQP Port:** `5672`
+- **Management UI:** `http://localhost:15672` (user: `admin`)
+- **Exchange Type:** `topic` (all 5 exchanges) — allows wildcard routing patterns like `user.*`
+- **Queue Durability:** All queues are declared **durable** (survive RabbitMQ restarts)
+- **Message Persistence:** All messages are published with `DeliveryMode: Persistent`
+- **ACK mode:** Manual ACK — messages are only acknowledged after successful handler execution; on failure, they are NACKed and **requeued**
+- **Connection retry:** On startup, each service attempts up to 5 connection retries (exponential backoff: `i × 3s`)
+
+### 2.3 Shared Go Packages (`pkg/`)
+
+| Package | Purpose |
+|---|---|
+| `pkg/jwt` | JWT generation, parsing, and SHA-256 hashing of refresh tokens |
+| `pkg/rabbitmq` | Shared RabbitMQ client, all event struct definitions, exchange/routing key constants |
+| `pkg/middleware` | Shared `AuthRequired` middleware that parses JWT and injects `user_id`, `role`, etc. into Gin context |
+| `pkg/logger` | Structured logger wrapper |
+
+### 2.4 API Gateway & Nginx
+
+- **Nginx** is the single public entry point on port 80.
+- **API Gateway** validates JWT for protected routes by calling `GET /auth/validate` on the auth-service.
+- After validation, the gateway injects user context headers (`X-User-ID`, `X-User-Role`, etc.) and forwards to downstream services.
+
+---
+
+## 3. Auth Service
+
+### Port & Database
+- **Port:** `8001`
+- **Database:** `auth_db` (PostgreSQL)
+- **Go Module:** `healthcare-platform/services/auth-service`
+
+### Database Schema
+
+**`users` table:**
+```sql
+CREATE TABLE users (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email         VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role          VARCHAR(20) CHECK (role IN ('patient', 'doctor', 'admin')),
+    first_name    VARCHAR(100) NOT NULL,
+    last_name     VARCHAR(100) NOT NULL,
+    is_verified   BOOLEAN DEFAULT FALSE,
+    is_active     BOOLEAN DEFAULT TRUE,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**`refresh_tokens` table:**
+```sql
+CREATE TABLE refresh_tokens (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+    token_hash VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Indexes:** `email`, `role`, `user_id` (on refresh_tokens), `token_hash`, `expires_at`  
+**Trigger:** `update_updated_at_column()` auto-updates `updated_at` on every row change.
+
+### API Endpoints
+
+| Method | Path | Description | Auth |
+|---|---|---|---|
+| `POST` | `/auth/register` | Register patient or doctor | Public |
+| `POST` | `/auth/login` | Login, get JWT tokens | Public |
+| `POST` | `/auth/logout` | Invalidate refresh token | Public |
+| `POST` | `/auth/refresh` | Rotate refresh token, issue new tokens | Public |
+| `GET` | `/auth/validate` | Validate JWT (called by API Gateway) | Internal |
+| `POST` | `/auth/deactivate` | Deactivate an account | Bearer JWT |
+| `GET` | `/health` | Liveness probe | Public |
+| `GET` | `/ready` | Readiness probe | Public |
+
+### Registration Workflow
+
+```
+Client → POST /auth/register
+  1. Validate request (email, password min 8 chars, role = patient|doctor)
+  2. Check email uniqueness in DB → 409 Conflict if exists
+  3. Hash password with bcrypt (cost=12, ~250ms — brute-force resistant)
+  4. Generate UUID → Create user record in DB
+  5. Build TokenResponse:
+     a. Generate short-lived JWT access token (RS256/HS256, 15 min TTL)
+     b. Generate refresh token = uuid() + uuid() (random opaque string)
+     c. SHA-256 hash the refresh token → store ONLY the hash in refresh_tokens table
+  6. Publish `user.registered` event to RabbitMQ (user_events exchange)
+     → patient-service subscribes and creates a patient profile
+     → notification-service subscribes and sends welcome email
+  7. Return { access_token, refresh_token, expires_in, user: {...} }
+```
+
+### Login Workflow
+
+```
+Client → POST /auth/login { email, password }
+  1. Find user by email → if not found, return 401 (same error prevents email enumeration)
+  2. Check is_active flag → 401 if deactivated
+  3. bcrypt.CompareHashAndPassword(stored_hash, entered_password)
+  4. On success → build new TokenResponse (same flow as registration step 5)
+  5. Publish `user.logged_in` event to RabbitMQ
+  6. Return tokens
+```
+
+### Token Refresh Workflow
+
+```
+Client → POST /auth/refresh { refresh_token: "..." }
+  1. SHA-256 hash the incoming token string
+  2. Look up hash in refresh_tokens table — 401 if not found
+  3. Fetch user by user_id — 401 if not found or inactive
+  4. DELETE old token hash from DB  (token rotation — limits stolen token window)
+  5. Issue new access + refresh token pair
+  6. Return new token response
+```
+
+### Token Validation (Internal)
+
+```
+API Gateway → GET /auth/validate
+  Authorization: Bearer <access_token>
+  1. Parse JWT: verify signature + expiry
+  2. If valid → return { valid: true, user_id, email, role, first_name, last_name }
+  3. If invalid → return { valid: false }  (HTTP 401)
+```
+
+### JWT Design
+
+| Token | Type | TTL | Storage |
+|---|---|---|---|
+| Access Token | JWT (HMAC-SHA256), contains `user_id`, `email`, `role`, `first_name`, `last_name` | 15 minutes | Client memory |
+| Refresh Token | Opaque random UUID pair, stored as SHA-256 hash in DB | 7 days | HTTP-only cookie (recommended) |
+
+**Security decisions:**
+- Passwords hashed with **bcrypt cost=12** — tuned for ~250ms to slow brute-force
+- Refresh tokens stored as SHA-256 hashes only — plaintext never persisted
+- **Token rotation** on every refresh call — old token immediately invalidated
+- Same `ErrInvalidCredentials` returned for both "user not found" and "wrong password" — prevents email enumeration
+
+### RabbitMQ Events Published
+
+| Event | Exchange | Routing Key | Payload |
+|---|---|---|---|
+| User registered | `user_events` | `user.registered` | `{user_id, email, first_name, last_name, role, timestamp}` |
+| User logged in | `user_events` | `user.logged_in` | Same as above |
+
+---
+
+## 4. Patient Service
+
+### Port & Database
+- **Port:** `8002`
+- **Database:** `patient_db` (PostgreSQL)
+
+### Database Schema
+
+```sql
+CREATE TABLE patients (
+    id                UUID PRIMARY KEY,
+    user_id           UUID UNIQUE NOT NULL,  -- FK to auth_db.users.id (cross-db reference by value)
+    email             VARCHAR(255) NOT NULL,
+    first_name        VARCHAR(100) NOT NULL,
+    last_name         VARCHAR(100) NOT NULL,
+    date_of_birth     DATE,
+    gender            VARCHAR(20),
+    phone_number      VARCHAR(20),
+    address           TEXT,
+    emergency_contact VARCHAR(255),
+    blood_group       VARCHAR(5),
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ DEFAULT NOW()
+);
+-- Indexes: user_id, email
+```
+
+### API Endpoints
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/v1/patient/profile` | JWT (patient) | Get own patient profile |
+| `PUT` | `/api/v1/patient/profile` | JWT (patient) | Full update of profile |
+| `PATCH` | `/api/v1/patient/profile` | JWT (patient) | Partial update |
+| `DELETE` | `/api/v1/patient/profile` | JWT (patient) | Delete profile + publish event |
+| `GET` | `/internal/v1/patients/by-user/:user_id` | Internal API Key | Lookup name by user_id (for appointment-service) |
+| `GET` | `/health` | Public | Health probe |
+
+**Internal API Key:** Protected by `X-Internal-Api-Key` header. Only accessible inside the Docker network (not exposed to the internet via Nginx). Used exclusively by appointment-service to enrich appointment records with patient names.
+
+### Profile Creation (Event-Driven)
+
+```
+auth-service publishes → user.registered
+  patient-service consumer:
+    1. Unmarshal UserRegisteredEvent { user_id, email, first_name, last_name, role }
+    2. Only acts if role = "patient"
+    3. Creates patient profile record in patient_db
+    4. patient.id = new UUID, patient.user_id = auth user_id
+```
+
+### EnsureProfile (Lazy Creation)
+
+When a patient calls `GET /api/v1/patient/profile`, the service calls `EnsureProfile`:
+```
+1. Try to find patient by user_id in DB
+2. If found → return existing profile
+3. If NOT found (e.g. RabbitMQ event was missed) →
+   Lazily create the profile from JWT claims (email, first_name, last_name)
+   Then return the newly created profile
+```
+This is a **fallback safety mechanism** in case the RabbitMQ `user.registered` event was not delivered.
+
+### Profile Deletion Workflow
+
+```
+Patient → DELETE /api/v1/patient/profile
+  1. Find patient record by user_id
+  2. Soft-validates existence → 404 if not found
+  3. Hard delete record from patient_db
+  4. Publish `patient.deleted` event to RabbitMQ (user_events exchange)
+     → appointment-service: deletes patient's appointments
+     → telemedicine-service: deletes patient's sessions
+     → payment-service: retains history (logs warning, no delete)
+     → file-storage-service: deletes patient's files from cloud storage
+```
+
+### RabbitMQ Events
+
+**Consumed:**
+- `user.registered` → creates patient profile
+
+**Published:**
+- `patient.deleted` → triggers cascading cleanup in other services
+
+---
+
+## 5. Appointment Service
+
+### Port & Database
+- **Port:** `8004`
+- **Database:** `appointment_db` (PostgreSQL)
+
+### Database Schema
+
+```sql
+-- Appointments table
+CREATE TABLE appointments (
+    id                   UUID PRIMARY KEY,
+    patient_id           UUID NOT NULL,
+    doctor_id            TEXT NOT NULL,         -- doctor profile UUID (stored as TEXT)
+    doctor_owner_user_id TEXT NOT NULL,         -- auth user_id of doctor
+    slot_id              UUID,                  -- optional reference to slots table
+    consultation_mode    TEXT DEFAULT 'physical', -- 'physical' | 'jitsi'
+    room_name            TEXT DEFAULT '',       -- Jitsi room name (for virtual)
+    join_url             TEXT DEFAULT '',       -- Jitsi join URL (hidden until paid)
+    scheduled_at         TIMESTAMPTZ NOT NULL,
+    duration_minutes     INT DEFAULT 30,
+    status               TEXT DEFAULT 'pending', -- pending|confirmed|cancelled|completed
+    payment_status       TEXT DEFAULT 'pending', -- pending|paid|expired
+    payment_due_at       TIMESTAMPTZ,
+    paid_at              TIMESTAMPTZ,
+    notes                TEXT,
+    created_at           TIMESTAMPTZ DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Doctor availability slots
+CREATE TABLE slots (
+    id         UUID PRIMARY KEY,
+    doctor_id  TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    hospital   TEXT NOT NULL,
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time   TIMESTAMPTZ NOT NULL,
+    is_booked  BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### API Endpoints
+
+| Method | Path | Roles | Description |
+|---|---|---|---|
+| `POST` | `/api/v1/appointments` | patient | Book a new appointment |
+| `GET` | `/api/v1/appointments` | patient, doctor, admin | List own appointments |
+| `GET` | `/api/v1/appointments/doctor/:doctor_id` | all | Get doctor's available slots |
+| `GET` | `/api/v1/appointments/:id` | all | Get appointment status |
+| `PUT` | `/api/v1/appointments/:id/cancel` | all | Cancel an appointment |
+| `PATCH` | `/api/v1/appointments/:id/status` | doctor, admin | Update appointment status |
+| `POST` | `/api/v1/slots` | doctor, admin | Create availability slot |
+| `GET` | `/api/v1/slots` | doctor, admin | List own slots |
+| `PUT` | `/api/v1/slots/:id` | doctor, admin | Update a slot |
+| `DELETE` | `/api/v1/slots/:id` | doctor, admin | Delete a slot |
+
+### Booking Workflow
+
+```
+Patient → POST /api/v1/appointments { slot_id, consultation_mode, payment_mode, payment_completed }
+
+  1. Validate role = "patient" (enforced by middleware)
+  2. Determine payment mode: "pay_now" (default) or "pay_later"
+  3. Validate consultation_mode: "physical" (default) or "jitsi"
+  4. Business rules:
+     - pay_now + payment_completed=false → 400 (must confirm payment first)
+     - pay_later + payment_completed=true → 400 (contradiction)
+     - pay_later restricted if appointment starts within 1 hour
+
+  5. If slot_id provided:
+     a. Load slot from DB → 404 if not found
+     b. Check is_booked → 409 Conflict if already booked
+     c. Check slot.start_time > now → 400 if in past
+     d. Extract doctor_id and doctor_owner_user_id from slot
+
+  6. HTTP call → doctor-service GET /doctors/:id (10s timeout)
+     Fetch doctor profile: channeling_fee (doctor's fee per consultation)
+     total_consult_fee = doctor_channeling_fee + LKR 500 (hospital fee)
+
+  7. If consultation_mode = "jitsi":
+     Generate random room name: "telemed-" + 16 random bytes (base32 encoded)
+     Set join_url = jitsi_base_url + "/" + room_name
+     join_url is HIDDEN from response until payment_status = "paid"
+
+  8. Set payment_status:
+     - payment_completed=true → PaymentPaid, paidAt=now
+     - else → PaymentPending, payment_due_at = min(scheduled_at, now+1h)
+
+  9. Save appointment to DB, mark slot as is_booked=true (atomic)
+
+ 10. Publish `appointment.booked` event to RabbitMQ:
+     → payment-service: creates a pending payment record (LKR amount)
+     → notification-service: sends confirmation email/SMS
+     → telemedicine-service: auto-creates a session record if mode=jitsi
+
+ 11. Return appointment (join_url stripped if not paid)
+```
+
+### Payment Expiry (Background Job)
+
+A background goroutine runs on a schedule and calls `ExpireOverdueAppointments`:
+```
+1. Query all appointments where payment_status='pending' AND payment_due_at < NOW()
+2. For each overdue appointment:
+   - Set status='cancelled', payment_status='expired'
+   - Release slot (set is_booked=false)
+3. Log count of expired appointments
+```
+
+### Appointment Cancellation
+
+```
+PUT /api/v1/appointments/:id/cancel
+  1. Validate ownership (patient: own appointment; doctor: own appointment; admin: any)
+  2. Load appointment from DB
+  3. If payment_status = "paid" → keep PaymentPaid; else → set PaymentExpired
+  4. Call CancelAndRelease: set status='cancelled', release slot if slot_id set
+  5. Publish `appointment.cancelled` event:
+     → payment-service: cancels the pending payment record
+     → notification-service: sends cancellation notice
+```
+
+### Inter-Service HTTP Calls Made
+
+1. **`GET doctor-service:8003/doctors/:id`** — Fetch doctor profile (channeling fee, name) during booking
+2. **`GET doctor-service:8003/doctors/me`** — Doctor fetching their own profile to create a slot
+3. **`GET patient-service:8002/internal/v1/patients/by-user/:user_id`** — Enrich appointment list with patient names (uses `X-Internal-Api-Key`)
+
+### RabbitMQ Events
+
+**Published:**
+- `appointment.booked` → triggers payment creation + notifications
+- `appointment.cancelled` → triggers payment cancellation + notifications
+
+**Consumed:**
+- `payment.completed` → marks appointment as paid, reveals join_url
+
+---
+
+## 6. Payment Service
+
+### Port & Database
+- **Port:** `8005`
+- **Database:** `payment_db` (PostgreSQL)
+
+### Database Schema
+
+```sql
+CREATE TABLE payments (
+    id             UUID PRIMARY KEY,
+    appointment_id UUID UNIQUE NOT NULL,  -- one payment per appointment (idempotency key)
+    patient_id     UUID NOT NULL,
+    amount         DECIMAL(10,2) NOT NULL,
+    currency       VARCHAR(3) NOT NULL,   -- "LKR"
+    status         VARCHAR(20) NOT NULL,  -- pending|completed|failed|cancelled
+    provider       VARCHAR(20) NOT NULL,  -- "payhere"
+    provider_id    VARCHAR(255),          -- PayHere transaction ID
+    created_at     TIMESTAMPTZ DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ DEFAULT NOW()
+);
+-- Indexes: appointment_id, patient_id
+```
+
+### API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/payments/` | Create a payment record |
+| `POST` | `/api/v1/payments/checkout` | Build PayHere checkout form data |
+| `POST` | `/api/v1/payments/:id/complete` | Manually mark payment as completed |
+| `POST` | `/api/v1/payments/webhook/payhere` | Receive PayHere payment notification |
+| `GET` | `/api/v1/payments/:id` | Get payment by ID |
+| `GET` | `/api/v1/payments/patient/:patient_id` | List payments by patient |
+
+### Payment Lifecycle
+
+```
+1. appointment.booked event received
+   → Consumer creates payment record: status=PENDING, provider="payhere", currency="LKR"
+   → Idempotency: if payment already exists for appointment_id → return existing record
+
+2. Patient initiates checkout:
+   POST /api/v1/payments/checkout { payment_id OR appointment_id, customer: {...}, items }
+   → PayHere provider builds checkout form:
+      - merchant_id, order_id (= payment.id), amount, currency
+      - HASH = MD5(merchant_id + order_id + amount + currency + MD5(merchant_secret))
+      - Returns: { checkout_url, fields: { ... all form params including signed hash } }
+   → Client renders a POST form to https://sandbox.payhere.lk/pay/checkout
+      (or https://www.payhere.lk/pay/checkout for production)
+
+3. PayHere completes/fails payment:
+   POST /api/v1/payments/webhook/payhere (PayHere calls this URL)
+   a. Verify MD5 signature:
+      expected = MD5(merchant_id + order_id + payhere_amount + payhere_currency + status_code + MD5(merchant_secret))
+      Compare with n.MD5Sig (case-insensitive)
+   b. Validate amounts and currency match stored payment record
+   c. Map PayHere status_code:
+      2 = completed, 0 = pending, -1/-2/-3 = failed/cancelled/chargedback
+   d. Update payment.status in DB, store provider_id (PayHere transaction ID)
+   e. If newly completed (was pending, now completed):
+      Publish `payment.completed` event to RabbitMQ
+      → appointment-service: marks appointment as paid, reveals join_url
+      → notification-service: sends payment receipt
+```
+
+### PayHere Integration Details
+
+- **Provider:** PayHere (Sri Lanka's leading payment gateway)
+- **Environments:** `sandbox` (https://sandbox.payhere.lk) | `live` (https://www.payhere.lk)
+- **Hash algorithm:** MD5 (PayHere's API requirement)
+- **Webhook security:** MD5 signature verification using merchant secret
+- **Amount validation:** Webhook amounts must match stored amounts exactly
+- **Key requirement:** `PAYHERE_NOTIFY_URL` **must be a publicly reachable URL** (e.g., via ngrok in dev); localhost URLs are rejected
+
+### Idempotency Design
+
+The `appointment_id` column has a `UNIQUE` constraint. Creating a payment for the same appointment twice returns the existing record if the parameters match, or a `409 Conflict` if they differ. This prevents duplicate payments.
+
+### RabbitMQ Events
+
+**Consumed:**
+- `appointment.booked` → auto-creates pending payment record
+- `appointment.cancelled` → cancels pending payment (does nothing if already paid)
+- `patient.deleted` → logs warning, retains payment history for audit purposes
+
+**Published:**
+- `payment.completed` → triggers appointment mark-as-paid + notification receipt
+
+---
+
+## 7. Telemedicine Service
+
+### Port & Database
+- **Port:** `8009`
+- **Database:** `telemedicine_db` (PostgreSQL)
+
+### Database Schema
+
+```sql
+CREATE TABLE telemedicine_sessions (
+    id                   UUID PRIMARY KEY,
+    appointment_id       UUID NOT NULL,
+    session_number       INT NOT NULL,           -- sequential per appointment
+    patient_id           UUID NOT NULL,
+    doctor_id            TEXT NOT NULL,
+    doctor_owner_user_id TEXT NOT NULL DEFAULT '',
+    room_name            TEXT NOT NULL UNIQUE,   -- Jitsi room name
+    join_url             TEXT NOT NULL,          -- https://meet.jit.si/{room_name}
+    provider             TEXT DEFAULT 'jitsi',
+    status               TEXT DEFAULT 'scheduled', -- scheduled|active|ended
+    purpose              TEXT,
+    notes                TEXT,
+    created_by_user_id   TEXT NOT NULL,
+    created_by_role      TEXT NOT NULL,
+    started_at           TIMESTAMPTZ,
+    ended_at             TIMESTAMPTZ,
+    created_at           TIMESTAMPTZ DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (appointment_id, session_number)      -- each session in sequence per appointment
+);
+```
+
+### API Endpoints
+
+| Method | Path | Roles | Description |
+|---|---|---|---|
+| `POST` | `/api/v1/telemedicine/appointments/:appointment_id/sessions` | patient, doctor | Create a session for a Jitsi appointment |
+| `GET` | `/api/v1/telemedicine/appointments/:appointment_id/sessions` | patient, doctor | List sessions for an appointment |
+| `GET` | `/api/v1/telemedicine/sessions/:id` | patient, doctor | Get session details |
+| `GET` | `/api/v1/telemedicine/sessions/:id/join` | patient, doctor | Get join info (room name + URL) |
+| `PATCH` | `/api/v1/telemedicine/sessions/:id/start` | patient, doctor | Mark session as started |
+| `PATCH` | `/api/v1/telemedicine/sessions/:id/end` | patient, doctor | Mark session as ended |
+
+### Telemedicine Workflow
+
+```
+1. Appointment is booked with consultation_mode="jitsi"
+   → appointment-service generates room_name and join_url
+   → Publishes appointment.booked event with room_name + join_url
+
+2. telemedicine-service RabbitMQ consumer receives appointment.booked:
+   → If consultation_mode != "jitsi" → skip
+   → Auto-creates a session record in telemedicine_db
+   → room_name is UNIQUE: if already exists, skips (idempotent)
+
+3. Patient/Doctor calls CREATE SESSION endpoint:
+   → HTTP call to appointment-service GET /api/v1/appointments/:id (passes JWT)
+   → Validates:
+      - appointment exists and caller owns it
+      - appointment is not cancelled
+      - consultation_mode must be "jitsi" (not physical)
+   → If session with same room_name already exists → return existing (idempotent)
+   → Creates new telemedicine_sessions record: status="scheduled"
+
+4. Joining a session:
+   GET /api/v1/telemedicine/sessions/:id/join
+   → Returns { session_id, room_name, join_url, provider="jitsi", status }
+   → Client navigates to join_url = https://meet.jit.si/{room_name}
+
+5. Managing session lifecycle:
+   PATCH /sessions/:id/start → status = "active", started_at = NOW()
+   PATCH /sessions/:id/end   → status = "ended",  ended_at = NOW()
+```
+
+### Jitsi Meet Integration
+
+- **Provider:** Jitsi Meet (open-source, no API key needed)
+- **Base URL:** `https://meet.jit.si` (configurable via `JITSI_BASE_URL`)
+- **Room Name Generation:** `"telemed-" + base32(16 random bytes)` — cryptographically random, lowercase
+- **Access Model:** Anyone with the room name/URL can join — security is enforced at the service level (checking appointment ownership)
+- **No Jitsi API calls needed:** The URL is simply generated and stored; actual video is handled by the public Jitsi infrastructure
+
+### Access Control
+
+Every session API call:
+1. Calls appointment-service HTTP to verify the appointment exists and caller owns it
+2. `patient`: must be `appointment.patient_id`
+3. `doctor`: must be `appointment.doctor_owner_user_id`
+4. No admin access to telemedicine sessions
+
+### RabbitMQ Events
+
+**Consumed:**
+- `appointment.booked` → auto-creates session if mode is jitsi
+
+---
+
+## 8. File Storage Service
+
+### Port & Database
+- **Port:** `8010`
+- **Database:** `file_storage_db` (PostgreSQL)
+
+### Database Schema
+
+```sql
+CREATE TABLE files (
+    id                  UUID PRIMARY KEY,
+    owner_id            TEXT NOT NULL,           -- user_id who owns the file
+    uploader_id         TEXT NOT NULL,           -- user_id who uploaded it
+    kind                TEXT NOT NULL,           -- 'image' | 'document'
+    storage_provider    TEXT NOT NULL,           -- 'cloudinary' | 'r2'
+    original_name       TEXT NOT NULL,
+    stored_name         TEXT NOT NULL,
+    mime_type           TEXT NOT NULL,
+    size_bytes          BIGINT DEFAULT 0,
+    checksum            TEXT DEFAULT '',         -- SHA-256 of file content
+    cloudinary_public_id TEXT DEFAULT '',
+    cloudinary_url      TEXT DEFAULT '',
+    r2_bucket           TEXT DEFAULT '',
+    r2_object_key       TEXT DEFAULT '',        -- path: healthcare-platform/{owner}/{year/month}/{name}-{uuid}.{ext}
+    is_public           BOOLEAN DEFAULT FALSE,
+    document_category   TEXT,                   -- 'prescription' | 'medical_report' | 'general'
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at          TIMESTAMPTZ             -- soft delete support
+);
+-- Indexes: owner_id, uploader_id, kind, storage_provider, created_at
+```
+
+### API Endpoints
+
+| Method | Path | Roles | Description |
+|---|---|---|---|
+| `POST` | `/api/v1/files/images` | all | Upload profile image (Cloudinary) |
+| `PUT` | `/api/v1/files/images` | all | Replace profile image (delete old from Cloudinary, upload new) |
+| `POST` | `/api/v1/files/documents` | all | Upload document (Cloudflare R2) |
+| `POST` | `/api/v1/files/patients/:patient_id/files` | all | Upload file for a patient |
+| `GET` | `/api/v1/files/patients/:patient_id/files` | all | List patient's files |
+| `GET` | `/api/v1/files` | all | List my files |
+| `GET` | `/api/v1/files/:id` | all | Get file metadata |
+| `GET` | `/api/v1/files/:id/download` | all | Download/redirect to file |
+| `DELETE` | `/api/v1/files/:id` | all | Delete file from storage + DB |
+
+### Storage Provider Routing
+
+| File Type | Storage | Why |
+|---|---|---|
+| **Images** (profile photos, medical images) | **Cloudinary** | CDN delivery, image transformations, public URL |
+| **Documents** (prescriptions, reports, PDFs) | **Cloudflare R2** | Private storage, S3-compatible, no egress fees, downloaded via signed stream |
+
+### Cloudinary Integration
+
+- **API:** `https://api.cloudinary.com/v1_1/{cloud_name}/image/upload`
+- **Auth:** SHA-1 signed parameters (sorted key=value pairs + API secret)
+- **Upload params:** `folder`, `public_id` (UUID), `timestamp`, `signature`
+- **Storage path:** `{configured_folder}/{sanitized_owner_id}/{uuid}`
+- **Delete API:** `https://api.cloudinary.com/v1_1/{cloud_name}/image/destroy`
+- **Response:** Returns `secure_url` (HTTPS CDN URL) and `public_id`
+- **Profile image policy:** One profile image per user enforced at application level; replacing sends delete request for old asset
+
+### Cloudflare R2 Integration
+
+- **Protocol:** AWS S3-compatible API using SigV4 signing (AWS4-HMAC-SHA256)
+- **Endpoint:** `https://{account_id}.r2.cloudflarestorage.com`
+- **Region:** `"auto"` (Cloudflare's global R2 region)
+- **Object key pattern:** `healthcare-platform/{owner_id}/{year}/{month}/{sanitized_name}-{uuid}.{ext}`
+- **Operations:** PUT (upload), GET (stream download), DELETE
+- **Custom SigV4 implementation:** Implements canonical request, scope, HMAC-SHA256 key derivation entirely in Go without AWS SDK
+- **Download:** Files are streamed directly from R2 and returned as HTTP response with `Content-Disposition: attachment`
+- **No public URLs:** Documents are never publicly accessible; always require authenticated download
+
+### File Upload Workflow
+
+```
+Client → POST /api/v1/files/images (multipart/form-data, field: "file")
+
+  1. Extract caller_id from JWT context
+  2. Read file bytes from multipart form
+  3. Detect MIME type: http.DetectContentType(first 512 bytes)
+  4. Compute SHA-256 checksum of full file content
+  5. Validate: images must have mime = "image/*"
+  6. Check for existing profile image:
+     - If exists and request is POST → 409 Conflict
+     - If exists and request is PUT → delete old from Cloudinary then replace
+  7. Upload to Cloudinary:
+     - Generate UUID public_id, compute SHA-1 signed params
+     - POST multipart to Cloudinary API
+     - Receive { secure_url, public_id }
+  8. Save file record to DB
+  9. Publish `file.uploaded` event to RabbitMQ (file_events exchange)
+ 10. Return { file: { id, cloudinary_url, ... } }
+```
+
+```
+Client → POST /api/v1/files/documents (multipart/form-data, field: "file")
+
+  1. Same steps 1–4 above
+  2. Validate: documents must NOT be images
+  3. Deduplication: SHA-256 checksum must be UNIQUE per owner → 409 if duplicate
+  4. Upload to R2 using SigV4 signed PUT request
+  5. Save { r2_bucket, r2_object_key } to DB
+  6. Publish `file.uploaded` event
+  7. Return file metadata (no public URL — must use /download endpoint)
+```
+
+### Access Control Logic
+
+```
+Who can access a file?
+  1. Admin → always allowed
+  2. Owner (callerID == file.owner_id) → always allowed
+  3. Doctor accessing patient files:
+     → HTTP call to appointment-service GET /api/v1/appointments (with doctor's JWT)
+     → Checks if any returned appointment has patient_id == file.owner_id
+     → If yes → doctor is assigned to this patient → allowed
+```
+
+### Document Categories
+
+Supported values for `document_category`:
+- `prescription` — Doctor-issued prescriptions
+- `medical_report` — Lab/imaging reports
+- `general` — All other documents (default)
+
+### RabbitMQ Events Published
+
+| Event | Exchange | Routing Key | Payload |
+|---|---|---|---|
+| File uploaded | `file_events` | `file.uploaded` | `{file_id, owner_id, uploader_id, kind, storage_provider, original_name, mime_type, size_bytes}` |
+| File deleted | `file_events` | `file.deleted` | `{file_id, owner_id, storage_provider}` |
+
+---
+
+## 9. RabbitMQ — Full Event Map
+
+### Exchanges
+
+| Exchange | Type | Description |
+|---|---|---|
+| `user_events` | topic | Auth and patient user lifecycle events |
+| `appointment_events` | topic | Appointment booking/cancellation events |
+| `payment_events` | topic | Payment lifecycle events |
+| `doctor_events` | topic | Doctor profile events |
+| `file_events` | topic | File upload/delete events |
+
+### Complete Publisher → Consumer Matrix
+
+| Routing Key | Publisher | Consumers | Purpose |
+|---|---|---|---|
+| `user.registered` | auth-service | patient-service, notification-service | Create patient profile on registration; send welcome email |
+| `user.logged_in` | auth-service | (notification-service, admin-service) | Login audit/tracking |
+| `user.deleted` | admin-service | (cleanup in other services) | Account removal |
+| `patient.deleted` | patient-service | appointment-service, telemedicine-service, file-storage-service, payment-service | Cascading cleanup on patient profile deletion |
+| `appointment.booked` | appointment-service | payment-service, notification-service, telemedicine-service | Create payment; send confirmation; create Jitsi session |
+| `appointment.cancelled` | appointment-service | payment-service, notification-service | Cancel pending payment; send cancellation notice |
+| `payment.completed` | payment-service | appointment-service, notification-service | Mark appointment as paid (reveals join_url); send receipt |
+| `doctor.created` | doctor-service | notification-service | Notify on doctor account creation |
+| `doctor.profile.updated` | doctor-service / file-storage-service | (admin-service) | Profile image or metadata update |
+| `file.uploaded` | file-storage-service | (admin-service, notification-service) | File audit trail |
+| `file.deleted` | file-storage-service | (admin-service) | File audit trail |
+
+### Queue Configuration
+
+Each service declares its own **named, durable queue** and binds it to the relevant routing keys. Example:
+- `payment_service_queue` bound to `appointment_events/appointment.booked`, `appointment_events/appointment.cancelled`, `user_events/patient.deleted`
+
+**Delivery Guarantee:** At-least-once (messages NACKed + requeued on processing failure). Services must be idempotent.
+
+---
+
+## 10. Inter-Service HTTP Calls
+
+| From | To | Endpoint | When | Auth |
+|---|---|---|---|---|
+| appointment-service | doctor-service | `GET /doctors/:id` | During booking — fetch channeling fee | No auth (internal network) |
+| appointment-service | doctor-service | `GET /doctors/me` | Doctor creating a slot — verify owns their profile | Bearer JWT (forwarded) |
+| appointment-service | patient-service | `GET /internal/v1/patients/by-user/:user_id` | Enriching appointment list with patient names | `X-Internal-Api-Key` header |
+| telemedicine-service | appointment-service | `GET /api/v1/appointments/:id` | Verifying appointment ownership before session ops | Bearer JWT (forwarded) |
+| file-storage-service | appointment-service | `GET /api/v1/appointments` | Checking doctor ↔ patient assignment for file access | Bearer JWT (forwarded) |
+| api-gateway | auth-service | `GET /auth/validate` | Validating every authenticated request | Bearer JWT (from client) |
+
+**Timeouts:** All internal HTTP clients use a 10-second timeout.
+
+---
+
+## 11. Database Summary
+
+| Service | DB Name | Key Tables |
+|---|---|---|
+| auth-service | `auth_db` | `users`, `refresh_tokens` |
+| patient-service | `patient_db` | `patients` |
+| appointment-service | `appointment_db` | `appointments`, `slots` |
+| payment-service | `payment_db` | `payments` |
+| telemedicine-service | `telemedicine_db` | `telemedicine_sessions` |
+| file-storage-service | `file_storage_db` | `files` |
+
+All databases use:
+- **UUID primary keys** (generated via `gen_random_uuid()` or `github.com/google/uuid` in Go)
+- **TIMESTAMPTZ** for all timestamps (UTC-aware)
+- **Performance indexes** on all FK-equivalent columns and frequently filtered fields
+- **Golang-migrate** for version-controlled schema migrations (run at service startup)
+
+---
+
+## 12. Security & Auth Mechanisms
+
+### JWT Token Flow
+
+```
+1. Client authenticates → auth-service issues:
+   - Access token (JWT, 15 min)
+   - Refresh token (opaque UUID pair, 7 days, stored as SHA-256 hash in DB)
+
+2. Every request to protected endpoints:
+   Client → Authorization: Bearer {access_token} → Nginx → API Gateway
+   Gateway → GET auth-service /auth/validate → { valid, user_id, role, ... }
+   If valid: Gateway injects X-User-ID, X-User-Role, X-User-Email headers → downstream service
+
+3. Downstream services read JWT from Authorization header using shared pkg/middleware.AuthRequired
+   This middleware calls jwtHelper.ParseAccessToken(), injects into Gin context:
+   - "user_id" → user's auth UUID
+   - "user_email" → email
+   - "first_name", "last_name"
+   - "role" → patient|doctor|admin
+
+4. Role-based access enforced by middleware.RequireRoles(...)
+```
+
+### Inter-Service Authentication
+
+| Channel | Mechanism |
+|---|---|
+| Service → auth-service validate | Bearer JWT (forwarded from client) |
+| appointment-service → patient-service | `X-Internal-Api-Key` header (shared secret in env) |
+| appointment-service → doctor-service | No auth (same internal Docker network) |
+| telemedicine-service → appointment-service | Bearer JWT (forwarded from client) |
+| file-storage-service → appointment-service | Bearer JWT (forwarded from client) |
+
+### Password Security
+
+- **bcrypt** with cost=12 (~250ms per hash)
+- Never stored in plaintext; only the bcrypt hash is persisted
+- Comparison uses `bcrypt.CompareHashAndPassword()` — timing-safe
+
+### Refresh Token Security
+
+- Tokens stored as **SHA-256 hashes** — if DB is compromised, tokens cannot be used
+- **Token rotation** on every refresh — old token invalidated immediately
+- Tokens scoped to specific user via FK with `ON DELETE CASCADE`
+
+### PayHere Webhook Security
+
+- MD5 signature verification on every incoming webhook
+- Amount and currency cross-validation against stored payment record
+- Merchant ID validation in notification payload
+
+---
+
+## 13. Third-Party API Integrations
+
+### 13.1 PayHere (Payment Gateway)
+
+| Attribute | Value |
+|---|---|
+| **Purpose** | Online payment processing for appointment fees (LKR) |
+| **Documentation** | https://support.payhere.lk/api-&-mobile-sdk/payhere-checkout |
+| **Environments** | Sandbox: `https://sandbox.payhere.lk` / Live: `https://www.payhere.lk` |
+| **Integration method** | Server-side form generation → client POSTs form to PayHere → webhook callback |
+| **Hash algorithm** | MD5 (PayHere requirement) |
+| **Webhook URL** | Must be publicly accessible (use ngrok for local dev) |
+| **Status codes** | 2=success, 0=pending, -1=cancelled, -2=failed, -3=chargedback |
+| **Config env vars** | `PAYHERE_MERCHANT_ID`, `PAYHERE_MERCHANT_SECRET`, `PAYHERE_ENV`, `PAYHERE_RETURN_URL`, `PAYHERE_CANCEL_URL`, `PAYHERE_NOTIFY_URL` |
+
+**Flow:**
+```
+Backend builds signed form fields → Client renders HTML form → POSTs to PayHere
+→ PayHere processes payment → Calls PAYHERE_NOTIFY_URL with notification
+→ Backend verifies MD5 signature → Updates payment status → Publishes event
+```
+
+### 13.2 Cloudinary (Image Storage & CDN)
+
+| Attribute | Value |
+|---|---|
+| **Purpose** | Cloud storage and CDN delivery of profile images and medical images |
+| **API Base** | `https://api.cloudinary.com/v1_1/{cloud_name}/` |
+| **Auth** | SHA-1 signed upload parameters + API key/secret |
+| **Upload endpoint** | `POST /image/upload` |
+| **Delete endpoint** | `POST /image/destroy` |
+| **Signed params** | Sorted `key=value` pairs joined with `&`, then `SHA1(params + api_secret)` |
+| **Config env vars** | `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `CLOUDINARY_UPLOAD_FOLDER` |
+
+**Key features used:**
+- Signed upload (no frontend SDK needed — backend handles all auth)
+- Unique `public_id` per file (UUID)
+- Auto-organized into folders by owner ID
+- Old profile images deleted via destroy API when replaced
+
+### 13.3 Cloudflare R2 (Document Storage)
+
+| Attribute | Value |
+|---|---|
+| **Purpose** | Private storage for medical documents (prescriptions, reports, PDFs) |
+| **Protocol** | S3-compatible API with AWS SigV4 signing |
+| **Region** | `auto` (Cloudflare's global distribution) |
+| **Operations** | PUT (upload), GET (download), DELETE |
+| **Signing** | AWS4-HMAC-SHA256 implemented from scratch in Go |
+| **No egress fees** | Key advantage over AWS S3 for large file serving |
+| **Config env vars** | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT` |
+
+**Object key format:** `healthcare-platform/{owner_id}/{year}/{month}/{sanitized_name}-{uuid}.{ext}`
+
+**No public access:** Documents require authenticated download through the backend service (streamed as HTTP response).
+
+### 13.4 Jitsi Meet (Video Consultations)
+
+| Attribute | Value |
+|---|---|
+| **Purpose** | Browser-based video consultations (telemedicine) |
+| **Service** | Free public Jitsi Meet infrastructure at `https://meet.jit.si` |
+| **No API key** | Uses public Jitsi rooms — no backend API calls needed |
+| **Room creation** | Rooms are instant on first join (no pre-creation needed) |
+| **Room name** | Cryptographically random: `"telemed-" + base32(16 random bytes)` |
+| **Config env var** | `JITSI_BASE_URL` (default: `https://meet.jit.si`) |
+
+**Access control:** Jitsi itself has no auth; security is enforced at the platform level:
+- `join_url` is hidden in appointment responses until `payment_status = "paid"`
+- Telemedicine service verifies appointment ownership before providing room details
+- Room names are random and unguessable
+
+### 13.5 OpenAI / Gemini (AI Symptom Analysis)
+
+| Attribute | Value |
+|---|---|
+| **Purpose** | AI-powered symptom analysis and medical guidance |
+| **Service** | Configurable: OpenAI (`gpt-4o-mini`) or Google Gemini (`gemini-2.5-flash`) |
+| **Config env vars** | `AI_PROVIDER`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `GEMINI_API_KEY`, `GEMINI_MODEL` |
+
+*(Detailed in ai-symptom-service — not covered in this document's primary scope)*
+
+---
+
+## Summary Reference
+
+### Service Port Map
+
+| Service | Port |
+|---|---|
+| auth-service | 8001 |
+| patient-service | 8002 |
+| doctor-service | 8003 |
+| appointment-service | 8004 |
+| payment-service | 8005 |
+| notification-service | 8006 |
+| admin-service | 8007 |
+| ai-symptom-service | 8008 |
+| telemedicine-service | 8009 |
+| file-storage-service | 8010 |
+| support-service | 8011 |
+
+### Key Architectural Decisions
+
+| Decision | Rationale |
+|---|---|
+| One DB per service | Strong isolation; schema changes in one service don't break others |
+| RabbitMQ topic exchange | Flexible routing; multiple consumers can bind to same event without coupling |
+| Durable queues + persistent messages | No message loss during RabbitMQ restarts or service downtime |
+| Manual ACK + NACK + requeue | At-least-once delivery; failed processing is retried |
+| Opaque refresh tokens (not JWT) | Refresh tokens can be invalidated server-side (JWTs cannot) |
+| bcrypt cost=12 | ~250ms hash time — practical for login, exponentially expensive for brute force |
+| SHA-256 hash of refresh tokens in DB | Stolen DB cannot be used to replay refresh tokens |
+| Cloudinary for images, R2 for docs | Images need CDN + public URL; documents need private access + zero egress cost |
+| Jitsi for video | Zero licensing cost, no vendor lock-in, browser-native WebRTC |
+| PayHere for payments | Sri Lanka's leading payment gateway, supports LKR |
+| Internal API Key for cross-service calls | Simpler than mutual TLS for same-network internal calls |
+| EnsureProfile fallback in patient-service | Guards against missed RabbitMQ events — lazy creation from JWT |
+| join_url hidden until paid | Prevents accessing telemedicine session without completing payment |
